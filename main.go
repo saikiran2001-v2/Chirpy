@@ -4,8 +4,10 @@ package main
 
 // Import the standard net/http package, which provides utilities for building HTTP servers
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 )
 
@@ -47,6 +49,37 @@ func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, _ *http.Request) {
 func (cfg *apiConfig) handlerReset(w http.ResponseWriter, _ *http.Request) {
 	cfg.fileServerHits.Store(0)
 	w.WriteHeader(http.StatusOK)
+}
+
+func respondWithError(w http.ResponseWriter, code int, msg string) {
+	type returnVals struct {
+		Error string `json:"error"`
+	}
+
+	respBody := returnVals{
+		Error: msg,
+	}
+
+	dat, err := json.Marshal(respBody)
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(dat)
+}
+
+func respondWithJson(w http.ResponseWriter, code int, payload interface{}) {
+	dat, err := json.Marshal(payload)
+	if err != nil {
+		respondWithError(w, 500, "Something went wrong")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(dat)
 }
 
 // main is the entry point of the program. Every Go executable starts execution here.
@@ -96,6 +129,49 @@ func main() {
 
 	// Reset the hit counter via a POST request to "/reset".
 	mux.HandleFunc("POST /admin/reset", c.handlerReset)
+
+	mux.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
+
+		type parameters struct {
+			Body string `json:"body"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		if len(params.Body) > 140 {
+			respondWithError(w, 400, "Chirp is too long")
+			return
+		}
+
+		newSplit := strings.Split(params.Body, " ")
+		for i, word := range newSplit {
+			if strings.ToLower(word) == "kerfuffle" {
+				newSplit[i] = "****"
+			}
+			if strings.ToLower(word) == "sharbert" {
+				newSplit[i] = "****"
+			}
+			if strings.ToLower(word) == "fornax" {
+				newSplit[i] = "****"
+			}
+		}
+
+		cleanedBody := strings.Join(newSplit, " ")
+		type returnVals struct {
+			CleanedBody string `json:"cleaned_body"`
+		}
+		respBody := returnVals{
+			CleanedBody: cleanedBody,
+		}
+
+		respondWithJson(w, 200, respBody)
+	})
 
 	// ---------------------------------------------------------------------
 	// STEP 4: Start the server and block until it stops
