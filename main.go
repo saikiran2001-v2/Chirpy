@@ -4,11 +4,17 @@ package main
 
 // Import the standard net/http package, which provides utilities for building HTTP servers
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+	"github.com/saikiran2001-v2/Chirpy/internal/database"
 )
 
 type apiConfig struct {
@@ -16,6 +22,7 @@ type apiConfig struct {
 	// We use an atomic counter because the handler may be called concurrently
 	// from multiple goroutines handling HTTP requests.
 	fileServerHits atomic.Int32
+	db             *database.Queries
 }
 
 // middlewareMetricInc returns a middleware that increments the file server hit counter
@@ -84,6 +91,15 @@ func respondWithJson(w http.ResponseWriter, code int, payload interface{}) {
 
 // main is the entry point of the program. Every Go executable starts execution here.
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		fmt.Println("Failed to connect to database:", err)
+		return
+	}
+	dbQueries := database.New(db)
+
 	// ---------------------------------------------------------------------
 	// STEP 1: Create a request multiplexer (router)
 	// ---------------------------------------------------------------------
@@ -102,7 +118,7 @@ func main() {
 		Handler: mux,
 	} // server is now ready, but not started yet.
 
-	c := apiConfig{}
+	c := apiConfig{db: dbQueries}
 
 	// ---------------------------------------------------------------------
 	// STEP 3: Register a handler for the root path ("/")
