@@ -11,11 +11,19 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/saikiran2001-v2/Chirpy/internal/auth"
+
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/saikiran2001-v2/Chirpy/internal/database"
 )
+
+type chirp struct {
+	db *database.Queries
+}
 
 type apiConfig struct {
 	// fileServerHits tracks how many times the static file server has been hit.
@@ -23,6 +31,8 @@ type apiConfig struct {
 	// from multiple goroutines handling HTTP requests.
 	fileServerHits atomic.Int32
 	db             *database.Queries
+	platform       string
+	jwtsecret      string
 }
 
 // middlewareMetricInc returns a middleware that increments the file server hit counter
@@ -53,7 +63,12 @@ func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, _ *http.Request) {
 
 // handlerReset resets the file server hit counter back to zero.
 // It is mapped to the "/reset" endpoint using the POST method.
-func (cfg *apiConfig) handlerReset(w http.ResponseWriter, _ *http.Request) {
+func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		respondWithError(w, 403, "Forbidden")
+		return
+	}
+	cfg.db.DeleteAllUsers(r.Context())
 	cfg.fileServerHits.Store(0)
 	w.WriteHeader(http.StatusOK)
 }
@@ -93,6 +108,8 @@ func respondWithJson(w http.ResponseWriter, code int, payload interface{}) {
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
+	platform := os.Getenv("PLATFORM")
+	jwtSecret := os.Getenv("JWT_SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Println("Failed to connect to database:", err)
@@ -118,7 +135,15 @@ func main() {
 		Handler: mux,
 	} // server is now ready, but not started yet.
 
-	c := apiConfig{db: dbQueries}
+	c := apiConfig{
+		db:        dbQueries,
+		platform:  platform,
+		jwtsecret: jwtSecret,
+	}
+
+	chir := chirp{
+		db: dbQueries,
+	}
 
 	// ---------------------------------------------------------------------
 	// STEP 3: Register a handler for the root path ("/")
@@ -146,10 +171,17 @@ func main() {
 	// Reset the hit counter via a POST request to "/reset".
 	mux.HandleFunc("POST /admin/reset", c.handlerReset)
 
-	mux.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
-
+	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Body string `json:"body"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		type response struct {
+			ID        string    `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Email     string    `json:"email"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -157,6 +189,265 @@ func main() {
 		err := decoder.Decode(&params)
 		if err != nil {
 			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+		hashedPass, err := auth.HashPassword(params.Password)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+		ctx := r.Context()
+		user, err := c.db.CreateUser(ctx, database.CreateUserParams{
+			Email:          params.Email,
+			HashedPassword: hashedPass,
+		})
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		respondWithJson(w, 201, response{
+			ID:        user.ID.String(),
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		})
+	})
+
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Password string `json:"password"`
+			Email    string `json:"email"`
+		}
+
+		type returnVals struct {
+			Id           string `json:"id"`
+			CreatedAt    string `json:"created_at"`
+			UpdatedAt    string `json:"updated_at"`
+			Email        string `json:"email"`
+			Token        string `json:"token"`
+			RefreshToken string `json:"refresh_token"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		ctx := r.Context()
+		user, err := chir.db.GetUser(ctx, params.Email)
+
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		if user.HashedPassword == "" {
+			respondWithError(w, 500, "no such user exists in our database")
+			return
+		}
+
+		checkMatch, err := auth.CheckPaswordHash(params.Password, user.HashedPassword)
+		if err != nil || !checkMatch {
+			respondWithError(w, 401, "Incorrect email or password")
+			return
+		}
+
+		token, err := auth.MakeJWT(user.ID, c.jwtsecret, time.Hour)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		refreshTokenStr := auth.MakeRefreshToken()
+		if refreshTokenStr == "" {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		_, err = c.db.CreateRefreshToken(ctx, database.CreateRefreshTokenParams{Token: refreshTokenStr, UserID: user.ID})
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		resp := returnVals{
+			Id:           user.ID.String(),
+			CreatedAt:    user.CreatedAt.String(),
+			UpdatedAt:    user.UpdatedAt.String(),
+			Email:        user.Email,
+			Token:        token,
+			RefreshToken: refreshTokenStr,
+		}
+
+		respondWithJson(w, 200, resp)
+	})
+
+	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		type returnVals struct {
+			ID        string    `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    string    `json:"user_id"`
+		}
+
+		ctx := r.Context()
+		chirps, err := chir.db.GetChirps(ctx)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong at get chirps")
+			return
+		}
+
+		resp := make([]returnVals, len(chirps))
+		for i, chirp := range chirps {
+			resp[i] = returnVals{
+				ID:        chirp.ID.String(),
+				CreatedAt: chirp.CreatedAt,
+				UpdatedAt: chirp.UpdatedAt,
+				Body:      chirp.Body,
+				UserID:    chirp.UserID.String(),
+			}
+		}
+		respondWithJson(w, 200, resp)
+	})
+
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Unauthorized")
+			return
+		}
+
+		ctx := r.Context()
+
+		refreshTokenstr, err := c.db.GetRefreshToken(ctx, token)
+		if err != nil {
+			respondWithError(w, 401, "Unauthorized")
+			return
+		}
+		if refreshTokenstr.ExpiresAt.Time.Before(time.Now()) {
+			respondWithError(w, 401, "Token expired")
+			return
+		}
+		if refreshTokenstr.RevokedAt.Valid {
+			respondWithError(w, 401, "Token revoked")
+			return
+		}
+
+		type returnVals struct {
+			Token string `json:"token"`
+		}
+
+		user, err := c.db.GetUserFromRefreshToken(ctx, refreshTokenstr.Token)
+		if err != nil {
+			respondWithError(w, 401, "Unauthorized")
+			return
+		}
+
+		accessToken, err := auth.MakeJWT(user.ID, c.jwtsecret, time.Hour)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		response := returnVals{
+			Token: accessToken,
+		}
+
+		respondWithJson(w, 200, response)
+	})
+
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		refreshToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 500, err.Error())
+			return
+		}
+
+		ctx := r.Context()
+
+		refreshTokenStr, err := c.db.GetRefreshToken(ctx, refreshToken)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		err = c.db.RevokeRefreshToken(ctx, refreshTokenStr.Token)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(204)
+	})
+
+	mux.HandleFunc("GET /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		chirpID := r.PathValue("chirpID")
+
+		type returnVals struct {
+			ID        string    `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    string    `json:"user_id"`
+		}
+
+		ctx := r.Context()
+		chirpIDConv, err := uuid.Parse(chirpID)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong while converting chirp id into UUID")
+			return
+		}
+
+		chirp, err := chir.db.GetChirp(ctx, chirpIDConv)
+
+		if err == sql.ErrNoRows {
+			respondWithError(w, 404, "Chirp not found")
+			return
+		}
+
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong when calling GetChirp")
+			return
+		}
+
+		response := returnVals{
+			ID:        chirp.ID.String(),
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID.String(),
+		}
+
+		respondWithJson(w, 200, response)
+	})
+
+	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Body string `json:"body"`
+		}
+
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Missing bearer token")
+			return
+		}
+
+		userID, err := auth.ValidateJWT(token, c.jwtsecret)
+		if err != nil {
+			respondWithError(w, 401, "Unauthorized")
+			return
+		}
+
+		params := parameters{}
+		decoder := json.NewDecoder(r.Body)
+		err = decoder.Decode(&params)
+
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong0")
 			return
 		}
 
@@ -180,13 +471,33 @@ func main() {
 
 		cleanedBody := strings.Join(newSplit, " ")
 		type returnVals struct {
-			CleanedBody string `json:"cleaned_body"`
-		}
-		respBody := returnVals{
-			CleanedBody: cleanedBody,
+			ID          string    `json:"id"`
+			CreatedAt   time.Time `json:"created_at"`
+			UpdatedAt   time.Time `json:"updated_at"`
+			CleanedBody string    `json:"body"`
+			UserID      string    `json:"user_id"`
 		}
 
-		respondWithJson(w, 200, respBody)
+		ctx := r.Context()
+		chirp, err := chir.db.CreateChirp(ctx, database.CreateChirpParams{
+			Body:   cleanedBody,
+			UserID: userID,
+		})
+
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong2")
+			return
+		}
+
+		respBody := returnVals{
+			ID:          chirp.ID.String(),
+			CreatedAt:   chirp.CreatedAt,
+			UpdatedAt:   chirp.UpdatedAt,
+			CleanedBody: cleanedBody,
+			UserID:      chirp.UserID.String(),
+		}
+
+		respondWithJson(w, 201, respBody)
 	})
 
 	// ---------------------------------------------------------------------
