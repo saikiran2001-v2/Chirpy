@@ -92,7 +92,7 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 	w.Write(dat)
 }
 
-func respondWithJson(w http.ResponseWriter, code int, payload interface{}) {
+func respondWithJson(w http.ResponseWriter, code int, payload any) {
 	dat, err := json.Marshal(payload)
 	if err != nil {
 		respondWithError(w, 500, "Something went wrong")
@@ -498,6 +498,111 @@ func main() {
 		}
 
 		respondWithJson(w, 201, respBody)
+	})
+
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		accessToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Unauthorized")
+			return
+		}
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		params := parameters{}
+		decoder := json.NewDecoder(r.Body)
+		err = decoder.Decode(&params)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		if params.Email == "" || params.Password == "" {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		hashedPass, err := auth.HashPassword(params.Password)
+		if err != nil {
+			respondWithError(w, 500, err.Error())
+			return
+		}
+
+		userID, err := auth.ValidateJWT(accessToken, c.jwtsecret)
+		if err != nil {
+			respondWithError(w, 401, err.Error())
+			return
+		}
+		ctx := r.Context()
+		user, err := c.db.UpdateUser(ctx, database.UpdateUserParams{
+			ID:             userID,
+			Email:          params.Email,
+			HashedPassword: hashedPass,
+		})
+		if err != nil {
+			respondWithError(w, 500, err.Error())
+			return
+		}
+
+		type returnVals struct {
+			ID        string `json:"id"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
+			Email     string `json:"email"`
+		}
+
+		response := returnVals{
+			ID:        user.ID.String(),
+			CreatedAt: user.CreatedAt.String(),
+			UpdatedAt: user.UpdatedAt.String(),
+			Email:     user.Email,
+		}
+
+		respondWithJson(w, 200, response)
+	})
+
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		chirpID := r.PathValue("chirpID")
+
+		accessToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, err.Error())
+			return
+		}
+
+		userID, err := auth.ValidateJWT(accessToken, c.jwtsecret)
+		if err != nil {
+			respondWithError(w, 500, err.Error())
+			return
+		}
+
+		ctx := r.Context()
+		chirpUID, err := uuid.Parse(chirpID)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+		chirp, err := c.db.GetChirp(ctx, chirpUID)
+		if err != nil {
+			respondWithError(w, 404, "chirp not found")
+			return
+		}
+
+		if chirp.UserID != userID {
+			respondWithError(w, 403, "Unauthorized")
+			return
+		}
+
+		err = c.db.DeleteChirp(ctx, chirpUID)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(204)
 	})
 
 	// ---------------------------------------------------------------------
