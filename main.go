@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -110,6 +111,8 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	jwtSecret := os.Getenv("JWT_SECRET")
+	apiKey := os.Getenv("POLKA_KEY")
+
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Println("Failed to connect to database:", err)
@@ -182,6 +185,7 @@ func main() {
 			CreatedAt time.Time `json:"created_at"`
 			UpdatedAt time.Time `json:"updated_at"`
 			Email     string    `json:"email"`
+			ChirpyRed bool      `json:"is_chirpy_red"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -211,6 +215,7 @@ func main() {
 			CreatedAt: user.CreatedAt,
 			UpdatedAt: user.UpdatedAt,
 			Email:     user.Email,
+			ChirpyRed: user.IsChirpyRed.Bool,
 		})
 	})
 
@@ -227,6 +232,7 @@ func main() {
 			Email        string `json:"email"`
 			Token        string `json:"token"`
 			RefreshToken string `json:"refresh_token"`
+			ChirpyRed    bool   `json:"is_chirpy_red"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -279,6 +285,7 @@ func main() {
 			CreatedAt:    user.CreatedAt.String(),
 			UpdatedAt:    user.UpdatedAt.String(),
 			Email:        user.Email,
+			ChirpyRed:    user.IsChirpyRed.Bool,
 			Token:        token,
 			RefreshToken: refreshTokenStr,
 		}
@@ -296,22 +303,63 @@ func main() {
 		}
 
 		ctx := r.Context()
-		chirps, err := chir.db.GetChirps(ctx)
-		if err != nil {
-			respondWithError(w, 500, "Something went wrong at get chirps")
-			return
+		queryParams := r.URL.Query()
+		authorID := queryParams.Get("author_id")
+		sortOrder := queryParams.Get("sort")
+
+		// default + validation
+		if sortOrder != "asc" && sortOrder != "desc" {
+			sortOrder = "asc"
 		}
 
-		resp := make([]returnVals, len(chirps))
-		for i, chirp := range chirps {
-			resp[i] = returnVals{
-				ID:        chirp.ID.String(),
-				CreatedAt: chirp.CreatedAt,
-				UpdatedAt: chirp.UpdatedAt,
-				Body:      chirp.Body,
-				UserID:    chirp.UserID.String(),
+		var resp []returnVals
+
+		if authorID != "" {
+			authorUID, err := uuid.Parse(authorID)
+			if err != nil {
+				respondWithError(w, 500, "Invalid author ID")
+				return
+			}
+			chirps, err := c.db.GetChirpsByAuthor(ctx, authorUID)
+			if err != nil {
+				respondWithError(w, 500, "Something went wrong")
+				return
+			}
+			resp = make([]returnVals, len(chirps))
+			for i, chirp := range chirps {
+				resp[i] = returnVals{
+					ID:        chirp.ID.String(),
+					CreatedAt: chirp.CreatedAt,
+					UpdatedAt: chirp.UpdatedAt,
+					Body:      chirp.Body,
+					UserID:    chirp.UserID.String(),
+				}
+			}
+		} else {
+			chirps, err := c.db.GetChirps(ctx)
+			if err != nil {
+				respondWithError(w, 500, "Something went wrong")
+				return
+			}
+			resp = make([]returnVals, len(chirps))
+			for i, chirp := range chirps {
+				resp[i] = returnVals{
+					ID:        chirp.ID.String(),
+					CreatedAt: chirp.CreatedAt,
+					UpdatedAt: chirp.UpdatedAt,
+					Body:      chirp.Body,
+					UserID:    chirp.UserID.String(),
+				}
 			}
 		}
+
+		sort.Slice(resp, func(i, j int) bool {
+			if sortOrder == "desc" {
+				return resp[i].CreatedAt.After(resp[j].CreatedAt)
+			}
+			return resp[i].CreatedAt.Before(resp[j].CreatedAt)
+		})
+
 		respondWithJson(w, 200, resp)
 	})
 
@@ -598,6 +646,56 @@ func main() {
 		err = c.db.DeleteChirp(ctx, chirpUID)
 		if err != nil {
 			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(204)
+	})
+
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		type data struct {
+			UserID string `json:"user_id"`
+		}
+		type parameters struct {
+			Event string `json:"event"`
+			Data  data   `json:"data"`
+		}
+
+		key, err := auth.GetAPIKey(r.Header)
+		if err != nil {
+			respondWithError(w, 401, err.Error())
+		}
+
+		if key != apiKey {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+		}
+
+		params := parameters{}
+		decoder := json.NewDecoder(r.Body)
+		err = decoder.Decode(&params)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong while decoding")
+			return
+		}
+
+		if params.Event != "user.upgraded" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(204)
+			return
+		}
+
+		userID, err := uuid.Parse(params.Data.UserID)
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong while user id parsing")
+			return
+		}
+		ctx := r.Context()
+
+		err = c.db.UpgradeUser(ctx, userID)
+		if err != nil {
+			respondWithError(w, 404, "User cannot be found")
 			return
 		}
 
